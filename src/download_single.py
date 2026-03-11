@@ -313,7 +313,11 @@ def attempt_download_with_browser(
 
                             # 增加对 Sci-Hub "Not Found" 样式的识别，避免傻等
                             page_text = page.inner_text("body").lower()
-                            if "not available" in title.lower() or "alas, the following paper" in page_text:
+                            if (
+                                "not available" in title.lower() or 
+                                "alas, the following paper" in page_text or
+                                "sci-hub has not included this article yet" in page_text
+                            ):
                                 print("\n    [SKIP] 镜像提示：该文献不在数据库中 (Not Found)")
                                 any_not_found = True
                                 break
