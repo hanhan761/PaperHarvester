@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables (API Keys)
+.env
+.env.*
+!.env.example
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+papers.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Project specific dynamic output & temp files
+output/
+temp_output.txt
+todo/
+src/mirror_stats.json
+
+# If you want to keep the todo/ and output/ folders but ignore their contents:
+# !todo/.gitkeep
+# !output/.gitkeep
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo

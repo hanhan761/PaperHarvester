@@ -1,0 +1,33 @@
+{
+    "topic_description": "火箭发动机设计",
+    "target_download_count": 500,
+    "seed_dois": [
+        "10.2514/1.B38364",
+        "10.1016/j.actaastro.2021.01.032"
+    ],
+    "paths": {
+        "todo_dir": "todo",
+        "output_dir": "output",
+        "db_file": "papers.db",
+        "download_script": "src/download_single.py",
+        "env_file": ".env"
+    },
+    "api": {
+        "semantic_scholar": "https://api.semanticscholar.org/graph/v1",
+        "crossref": "https://api.crossref.org/works",
+        "deepseek_url": "https://api.deepseek.com/v1/chat/completions",
+        "deepseek_model": "deepseek-chat"
+    },
+    "timeouts": {
+        "http_timeout_sec": 30,
+        "download_subprocess_timeout_sec": 300,
+        "api_call_interval_sec": 1.5,
+        "max_runtime_sec": 3600,
+        "inactivity_timeout_sec": 600
+    },
+    "snowball": {
+        "enabled": true,
+        "extract_from_downloaded_pdf": true,
+        "max_depth": 3
+    }
+}

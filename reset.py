@@ -1,0 +1,63 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+reset.py — 一键删除文献下载记忆与缓存
+===========================================
+运行此脚本将：
+1. 删除 SQLite 数据库文件 (papers.db, papers.db-wal, papers.db-shm)
+2. 清空输出文件夹 (output/) 内已下载的全部 PDF 和子文件夹
+方便您在修改配置或策略后“从头再来”。
+"""
+
+import shutil
+import time
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+
+def main():
+    print("==================================================")
+    print("⚠️  警告：您正在重置 PaperHarvester 的全部下载记录！")
+    print("==================================================")
+    print("这将永久删除：")
+    print("  - sqlite 数据库记录（所有已筛选、下载、打分的状态）")
+    print("  - output 目录下的所有 PDF 文件")
+    print()
+    
+    confirm = input("输入 'y' 确认删除并从头开始，其他任意键取消: ").strip().lower()
+    if confirm != 'y':
+        print("操作已取消。")
+        return
+
+    # 1. 删除数据库文件
+    db_files = ["papers.db", "papers.db-wal", "papers.db-shm"]
+    print("\n[1/2] 正在清理数据库缓存...")
+    for f_name in db_files:
+        f_path = BASE_DIR / f_name
+        if f_path.exists():
+            try:
+                f_path.unlink()
+                print(f"  ✓ 删除 {f_name}")
+            except Exception as e:
+                print(f"  ✗ 删除 {f_name} 失败: {e} (请确保没有程序正在占用)")
+
+    # 2. 清理下载目录
+    output_dir = BASE_DIR / "output"
+    print("\n[2/2] 正在清理下载目录...")
+    if output_dir.exists():
+        try:
+            # 删除再重建
+            shutil.rmtree(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            print(f"  ✓ 清空目录 {output_dir.name}/")
+        except Exception as e:
+            print(f"  ✗ 清理目录 {output_dir.name} 失败: {e} (请确保文件夹内文件未被占用)")
+    else:
+        print("  ✓ output 目录原本就不存在，跳过。")
+
+    print("\n==================================================")
+    print("✅ 重置完成！您可以重新运行 main.py 开始新的滚雪球下载了。")
+    time.sleep(1)
+
+if __name__ == "__main__":
+    main()
