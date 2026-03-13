@@ -266,7 +266,7 @@ def attempt_download_with_browser(
     1 - 网络错误或超时 (建议重试)
     2 - 明确找不到该文献 (不要重试)
     """
-    print(f"\n  [headed] 启动浏览器...")
+    print(f"\n  [headless] 启动浏览器(后台静默模式)...")
 
     CHECK_INTERVAL = 1
     MAX_WAIT_TIME = 180
@@ -274,9 +274,9 @@ def attempt_download_with_browser(
     try:
         with sync_playwright() as p:
             try:
-                browser = p.chromium.launch(headless=False, channel="chrome")
+                browser = p.chromium.launch(headless=True, channel="chrome")
             except Exception:
-                browser = p.chromium.launch(headless=False)
+                browser = p.chromium.launch(headless=True)
 
             context = browser.new_context(
                 accept_downloads=True,
