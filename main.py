@@ -172,6 +172,7 @@ INACTIVITY_TIMEOUT_SEC      = CFG["timeouts"]["inactivity_timeout_sec"]
 SNOWBALL_ENABLED            = CFG["snowball"]["enabled"]
 SNOWBALL_FROM_PDF           = CFG["snowball"]["extract_from_downloaded_pdf"]
 SNOWBALL_MAX_DEPTH          = CFG["snowball"]["max_depth"]
+MAX_METADATA_RETRIES        = CFG.get("max_metadata_retries", 3)
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║                      日 志 初 始 化                              ║
@@ -218,6 +219,7 @@ class PaperDatabase:
                 status      TEXT DEFAULT 'pending',
                 depth       INTEGER DEFAULT 0,
                 parent_score INTEGER DEFAULT 5,
+                retry_count INTEGER DEFAULT 0,
                 added_at    TEXT DEFAULT '',
                 updated_at  TEXT DEFAULT ''
             )
@@ -236,7 +238,7 @@ class PaperDatabase:
         """)
         self.conn.commit()
         # 自动迁移：如果旧表缺少列，自动添加
-        for col, typedef in [("parent_score", "INTEGER DEFAULT 5"), ("best_topic", "TEXT DEFAULT ''")]:
+        for col, typedef in [("parent_score", "INTEGER DEFAULT 5"), ("best_topic", "TEXT DEFAULT ''"), ("retry_count", "INTEGER DEFAULT 0")]:
             try:
                 self.conn.execute(f"SELECT {col} FROM papers LIMIT 1")
             except sqlite3.OperationalError:
@@ -370,6 +372,18 @@ class PaperDatabase:
             return row[0] if row else 0
         except Exception:
             return 0
+
+    def increment_retry(self, doi: str) -> int:
+        """增加指定 DOI 的重试计数并返回新值。"""
+        now = datetime.now().isoformat()
+        self.conn.execute(
+            "UPDATE papers SET retry_count = retry_count + 1, updated_at = ? WHERE doi = ?",
+            (now, doi),
+        )
+        self.conn.commit()
+        cursor = self.conn.execute("SELECT retry_count FROM papers WHERE doi = ?", (doi,))
+        row = cursor.fetchone()
+        return row[0] if row else 0
 
     # ── 种子文件跟踪方法 ──
 
@@ -1533,8 +1547,12 @@ def main():
                 db.update_paper(doi, title=title, abstract=abstract)
 
             if not title:
-                logger.warning(f"[yellow]  ⚠ 无法获取元数据，跳过（回退到队尾）[/]")
-                db.update_paper(doi)
+                retries = db.increment_retry(doi)
+                if retries >= MAX_METADATA_RETRIES:
+                    logger.warning(f"[yellow]  ⚠ 元数据获取失败已达 {retries} 次上限，标记为 failed[/]")
+                    db.update_paper(doi, status="failed")
+                else:
+                    logger.warning(f"[yellow]  ⚠ 无法获取元数据，第 {retries}/{MAX_METADATA_RETRIES} 次重试，回退到队尾[/]")
                 continue
 
             # 2f. 多主题评估
