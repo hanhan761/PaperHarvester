@@ -11,6 +11,7 @@ PaperHarvester — 自动化文献滚雪球检索与下载系统
 
 import os
 import re
+import hashlib
 import sys
 import io
 import json
@@ -88,14 +89,13 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 
 def _load_config() -> Dict[str, Any]:
-    """从 config.json 加载配置，如不存在则返回默认值"""
+    """从 config.json 加载配置，支持多主题格式，兼容旧单主题格式。"""
     defaults: Dict[str, Any] = {
-        "topic_description": "火箭发动机推力室一体化设计、再生冷却与增材制造",
+        "storage_path": "",
         "target_download_count": 50,
-        "seed_dois": ["10.2514/1.B38364", "10.1016/j.actaastro.2021.01.032"],
+        "topics": [{"name": "默认主题", "description": "火箭发动机推力室一体化设计"}],
         "paths": {
-            "todo_dir": "todo", "output_dir": "output",
-            "db_file": "papers.db", "download_script": "src/download_single.py",
+            "download_script": "src/download_single.py",
             "env_file": ".env"
         },
         "api": {
@@ -121,9 +121,14 @@ def _load_config() -> Dict[str, Any]:
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 user_cfg = json.load(f)
+            # 向后兼容：旧单主题格式自动转换
+            if "topic_description" in user_cfg and "topics" not in user_cfg:
+                user_cfg["topics"] = [{
+                    "name": "默认主题",
+                    "description": user_cfg.pop("topic_description")
+                }]
             # 深度合并
-            user_cfg_dict: Dict[str, Any] = user_cfg
-            for k, v in user_cfg_dict.items():
+            for k, v in user_cfg.items():
                 kn: str = str(k)
                 if isinstance(v, dict) and kn in defaults and isinstance(defaults.get(kn), dict):
                     d_val = defaults[kn]
@@ -138,13 +143,18 @@ def _load_config() -> Dict[str, Any]:
 CFG = _load_config()
 
 # ── 从配置中提取常量 ──
-TOPIC_DESCRIPTION: str     = CFG["topic_description"]
 TARGET_DOWNLOAD_COUNT: int = CFG["target_download_count"]
-SEED_DOIS: list            = CFG["seed_dois"]
+TOPICS: List[Dict[str, str]] = CFG["topics"]
 
-TODO_DIR       = BASE_DIR / CFG["paths"]["todo_dir"]
-OUTPUT_DIR     = BASE_DIR / CFG["paths"]["output_dir"]
-DB_PATH        = BASE_DIR / CFG["paths"]["db_file"]
+# ── 存储路径计算 ──
+_storage_path_raw: str = CFG.get("storage_path", "")
+if _storage_path_raw:
+    STORAGE_ROOT = Path(_storage_path_raw)
+else:
+    STORAGE_ROOT = BASE_DIR  # 未指定时使用项目目录
+
+TODO_DIR       = STORAGE_ROOT / "todo"
+DB_PATH        = STORAGE_ROOT / "papers.db"
 DOWNLOAD_SCRIPT = BASE_DIR / CFG["paths"]["download_script"]
 ENV_PATH       = BASE_DIR / CFG["paths"]["env_file"]
 
@@ -162,8 +172,6 @@ INACTIVITY_TIMEOUT_SEC      = CFG["timeouts"]["inactivity_timeout_sec"]
 SNOWBALL_ENABLED            = CFG["snowball"]["enabled"]
 SNOWBALL_FROM_PDF           = CFG["snowball"]["extract_from_downloaded_pdf"]
 SNOWBALL_MAX_DEPTH          = CFG["snowball"]["max_depth"]
-
-DEFAULT_SEED_DOIS = SEED_DOIS  # 兼容别名
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║                      日 志 初 始 化                              ║
@@ -206,6 +214,7 @@ class PaperDatabase:
                 title       TEXT DEFAULT '',
                 abstract    TEXT DEFAULT '',
                 relevance_score INTEGER DEFAULT 0,
+                best_topic  TEXT DEFAULT '',
                 status      TEXT DEFAULT 'pending',
                 depth       INTEGER DEFAULT 0,
                 parent_score INTEGER DEFAULT 5,
@@ -213,14 +222,27 @@ class PaperDatabase:
                 updated_at  TEXT DEFAULT ''
             )
         """)
+        # 新增：已处理种子文件跟踪表
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS processed_seeds (
+                file_hash    TEXT PRIMARY KEY,
+                filename     TEXT NOT NULL,
+                file_size    INTEGER DEFAULT 0,
+                best_topic   TEXT DEFAULT '',
+                score        INTEGER DEFAULT 0,
+                processed_at TEXT DEFAULT '',
+                doi_count    INTEGER DEFAULT 0
+            )
+        """)
         self.conn.commit()
-        # 自动迁移：如果旧表缺少 parent_score 列，自动添加
-        try:
-            self.conn.execute("SELECT parent_score FROM papers LIMIT 1")
-        except sqlite3.OperationalError:
-            self.conn.execute("ALTER TABLE papers ADD COLUMN parent_score INTEGER DEFAULT 5")
-            self.conn.commit()
-            logger.info("[dim]数据库迁移：已添加 parent_score 列[/]")
+        # 自动迁移：如果旧表缺少列，自动添加
+        for col, typedef in [("parent_score", "INTEGER DEFAULT 5"), ("best_topic", "TEXT DEFAULT ''")]:
+            try:
+                self.conn.execute(f"SELECT {col} FROM papers LIMIT 1")
+            except sqlite3.OperationalError:
+                self.conn.execute(f"ALTER TABLE papers ADD COLUMN {col} {typedef}")
+                self.conn.commit()
+                logger.info(f"[dim]数据库迁移：已添加 {col} 列[/]")
 
     def add_doi(self, doi: str, depth: int = 0, parent_score: int = 5) -> bool:
         """
@@ -284,6 +306,7 @@ class PaperDatabase:
         title: Optional[str] = None,
         abstract: Optional[str] = None,
         relevance_score: Optional[int] = None,
+        best_topic: Optional[str] = None,
         status: Optional[str] = None,
     ):
         """更新指定 DOI 的字段，仅更新非 None 的参数。"""
@@ -298,6 +321,9 @@ class PaperDatabase:
         if relevance_score is not None:
             fields.append("relevance_score = ?")
             values.append(relevance_score)
+        if best_topic is not None:
+            fields.append("best_topic = ?")
+            values.append(best_topic)
         if status is not None:
             fields.append("status = ?")
             values.append(status)
@@ -344,6 +370,49 @@ class PaperDatabase:
             return row[0] if row else 0
         except Exception:
             return 0
+
+    # ── 种子文件跟踪方法 ──
+
+    @staticmethod
+    def compute_seed_hash(pdf_path: Path) -> str:
+        """计算种子 PDF 的指纹：sha256(文件名|大小|修改时间)。"""
+        stat = pdf_path.stat()
+        fingerprint = f"{pdf_path.name}|{stat.st_size}|{stat.st_mtime}"
+        return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+
+    def is_seed_processed(self, file_hash: str) -> bool:
+        """检查指定指纹的种子文件是否已处理。"""
+        cursor = self.conn.execute(
+            "SELECT 1 FROM processed_seeds WHERE file_hash = ? LIMIT 1", (file_hash,)
+        )
+        return cursor.fetchone() is not None
+
+    def mark_seed_processed(
+        self,
+        file_hash: str,
+        filename: str,
+        file_size: int,
+        best_topic: str = "",
+        score: int = 0,
+        doi_count: int = 0,
+    ):
+        """标记一个种子文件为已处理。"""
+        now = datetime.now().isoformat()
+        try:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO processed_seeds "
+                "(file_hash, filename, file_size, best_topic, score, processed_at, doi_count) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (file_hash, filename, file_size, best_topic, score, now, doi_count),
+            )
+            self.conn.commit()
+        except Exception as e:
+            logger.warning(f"[yellow]标记种子文件失败: {e}[/]")
+
+    def count_processed_seeds(self) -> int:
+        """返回已处理的种子文件总数。"""
+        cursor = self.conn.execute("SELECT COUNT(*) FROM processed_seeds")
+        return cursor.fetchone()[0]
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -573,7 +642,7 @@ class RelevanceEvaluator:
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.1,
-            "max_tokens": 200,
+            "max_tokens": 500,
         }
         resp = self.session.post(DEEPSEEK_API_URL, json=payload, timeout=HTTP_TIMEOUT)
         resp.raise_for_status()
@@ -652,6 +721,119 @@ class RelevanceEvaluator:
             logger.error(f"[red]  ✗ DeepSeek API 调用失败: {type(e).__name__}: {e}[/]")
             return 5, f"API 调用失败 ({type(e).__name__})，默认中等相关"
 
+    def _build_multi_prompt(self, title: str, abstract: str, topics: List[Dict[str, str]]) -> str:
+        """构造多主题同时评估的 Prompt。"""
+        topics_text = "\n".join(
+            f"  {i+1}. 【{t['name']}】: {t['description']}"
+            for i, t in enumerate(topics)
+        )
+        return f"""你是一位学术文献相关性评估专家。请根据以下信息，判断该论文与每个研究方向的契合程度。
+
+【研究方向列表】
+{topics_text}
+
+【待评估论文】
+标题: {title}
+摘要: {abstract if abstract else '（摘要缺失，请仅根据标题判断）'}
+
+【评分标准 (1-10)】
+- 9~10 分: 核心相关，论文直接研究该方向的核心问题。
+- 7~8 分: 高度相关，论文涉及该方向的重要子领域或关键支撑技术。
+- 5~6 分: 中等相关，论文提供了与该方向相关的基础理论或通用方法。
+- 3~4 分: 边缘相关，论文仅有间接的技术联系。
+- 1~2 分: 不相关。
+
+【输出要求】
+对每个方向分别打分。你必须且只能输出一个 JSON 对象，不要输出任何其他文字。
+格式如下:
+{{"scores": [{{"topic": "<方向名称>", "score": <1到10的整数>, "reason": "<简短理由，不超30字>"}}]}}"""
+
+    def _parse_multi_response(self, raw: str, topics: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+        """
+        解析多主题评估结果。
+        返回: [{"topic": "xxx", "score": N, "reason": "..."}, ...]
+        """
+        try:
+            cleaned: str = str(raw).strip()
+            if cleaned.startswith("```"):
+                first_newline = cleaned.find("\n")
+                last_backtick = cleaned.rfind("```")
+                if last_backtick > first_newline and first_newline != -1:
+                    cleaned = cleaned[first_newline + 1 : last_backtick].strip()
+                else:
+                    cleaned = cleaned[first_newline + 1 :].strip()
+
+            result = json.loads(cleaned)
+            scores_list = result.get("scores", [])
+
+            # 校验并修正
+            parsed: List[Dict[str, Any]] = []
+            for item in scores_list:
+                score = max(1, min(10, int(item.get("score", 5))))
+                parsed.append({
+                    "topic": str(item.get("topic", "")),
+                    "score": score,
+                    "reason": str(item.get("reason", "无")),
+                })
+            return parsed
+
+        except (json.JSONDecodeError, ValueError, KeyError, TypeError) as e:
+            raw_str = str(raw) if raw else ""
+            logger.warning(
+                f"[yellow]  ⚠ 多主题评估回复解析失败 ({type(e).__name__}), 使用默认评分。原始: {raw_str[:120]}[/]"
+            )
+            # 回退：给所有主题默认 5 分
+            return [{"topic": t["name"], "score": 5, "reason": "解析失败，默认评分"} for t in topics]
+
+    def evaluate_multi(self, title: str, abstract: str, topics: List[Dict[str, str]]) -> Tuple[int, str, str]:
+        """
+        多主题评估：一次 API 调用评估论文与所有研究方向的契合度。
+        返回: (best_score, best_topic_name, reason)
+        """
+        if not title and not abstract:
+            return 5, topics[0]["name"], "标题和摘要均缺失，默认归入第一个方向"
+
+        prompt = self._build_multi_prompt(title, abstract, topics)
+
+        try:
+            logger.info(f"[magenta]🤖 DeepSeek 多主题评估 ({len(topics)} 个方向)...[/]")
+            raw_response = self._call_deepseek(prompt)
+            scores = self._parse_multi_response(raw_response, topics)
+
+            # 找最高分的 topic
+            best = max(scores, key=lambda x: x["score"]) if scores else {"topic": topics[0]["name"], "score": 5, "reason": "无评分结果"}
+
+            # 打印所有方向的评分
+            for s in scores:
+                sc = s["score"]
+                if sc >= 7:
+                    color = "green"
+                elif sc >= 5:
+                    color = "yellow"
+                else:
+                    color = "dim"
+                marker = " ★" if s["topic"] == best["topic"] else ""
+                logger.info(f"[{color}]    {s['topic']}: {sc}/10 — {s['reason']}{marker}[/]")
+
+            best_score = int(best["score"])
+            if best_score >= 9:
+                label = "🔴 核心相关"
+            elif best_score >= 7:
+                label = "🟠 高度相关"
+            elif best_score >= 5:
+                label = "🟡 中等相关"
+            elif best_score >= 3:
+                label = "🔵 边缘相关"
+            else:
+                label = "⚪ 不相关"
+            logger.info(f"[magenta]  → 最佳归属: 【{best['topic']}】 {label} (score={best_score}/10)[/]")
+            time.sleep(API_CALL_INTERVAL)
+            return best_score, str(best["topic"]), str(best["reason"])
+
+        except Exception as e:
+            logger.error(f"[red]  ✗ DeepSeek 多主题评估失败: {type(e).__name__}: {e}[/]")
+            return 5, topics[0]["name"], f"API 失败，默认归入 {topics[0]['name']}"
+
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║                模块 4：下载器  PaperDownloader                    ║
@@ -663,7 +845,7 @@ class PaperDownloader:
     根据子进程 exit code 判断成功/失败。
     """
 
-    def __init__(self, script_path: Path = BASE_DIR / "src" / "download_single.py", output_dir: Path = OUTPUT_DIR):
+    def __init__(self, script_path: Path = BASE_DIR / "src" / "download_single.py", output_dir: Path = STORAGE_ROOT):
         self.script_path = script_path
         self.output_dir = output_dir
         if not self.script_path.exists():
@@ -865,18 +1047,15 @@ def _parse_reference_entries(ref_text: str) -> List[str]:
             best_splits = candidate
 
     if len(best_splits) >= 3:
-        # 根据匹配位置切分
         for i, m in enumerate(best_splits):
             start = m.start()
             end = best_splits[i + 1].start() if i + 1 < len(best_splits) else len(ref_text)
             entry = ref_text[start:end].strip()
-            # 去掉编号前缀，保留纯引用文本
             entry = re.sub(r'^\s*\[?\d+\]?\.?\s*', '', entry)
-            entry = ' '.join(entry.split())  # 合并多余空白/换行
-            if len(entry) > 10:  # 过短的丢弃
+            entry = ' '.join(entry.split())
+            if len(entry) > 10:
                 entries.append(entry)
     else:
-        # 兜底：按段落拆分
         paragraphs = re.split(r'\n\s*\n', ref_text)
         for p in paragraphs:
             p = ' '.join(p.split()).strip()
@@ -891,7 +1070,6 @@ def _resolve_doi_via_crossref(query_text: str, session: requests.Session) -> Opt
     使用 Crossref 的 query.bibliographic 查询，将一条引用文本解析为 DOI。
     返回最佳匹配的 DOI 或 None。
     """
-    # 截取前 200 个字符作为查询（太长会影响 API 效果）
     query = query_text[:200].strip()
     if len(query) < 15:
         return None
@@ -913,8 +1091,6 @@ def _resolve_doi_via_crossref(query_text: str, session: requests.Session) -> Opt
 
         best = items[0]
         score = best.get("score", 0)
-        # Crossref 的 score 一般 >50 表示较好的匹配
-        # 为避免误匹配，设置最低阈值
         if score < 30:
             return None
 
@@ -958,7 +1134,6 @@ def extract_dois_from_pdf(pdf_path: Path) -> List[str]:
     # ── 策略 1: PyMuPDF 文本提取 ──
     full_text = _extract_full_text_from_pdf(pdf_path)
     if full_text:
-        # 1a. 先从全文中正则提取所有 DOI（包括正文中引用的 DOI 链接）
         for m in _DOI_RE.finditer(full_text):
             cleaned = _clean_doi(m.group(1))
             if cleaned:
@@ -967,14 +1142,12 @@ def extract_dois_from_pdf(pdf_path: Path) -> List[str]:
         text_doi_count = len(all_dois)
         logger.info(f"[cyan]  📄 PDF 全文 DOI 正则: 找到 {text_doi_count} 个[/]")
 
-        # 1b. 定位 References 节并拆分引用条目
         ref_text = _find_references_section(full_text)
         if ref_text:
             entries = _parse_reference_entries(ref_text)
             logger.info(f"[cyan]  📚 References 节: 识别到 {len(entries)} 条引用[/]")
 
             if entries:
-                # 对每条引用：先尝试正则提取 DOI，没有则用 Crossref 查询
                 crossref_session = requests.Session()
                 crossref_session.headers.update({
                     "User-Agent": "PaperHarvester/1.0 (Academic Research Tool; mailto:research@example.com)"
@@ -983,7 +1156,6 @@ def extract_dois_from_pdf(pdf_path: Path) -> List[str]:
                 crossref_failed = 0
 
                 for i, entry in enumerate(entries):
-                    # 先正则提取
                     doi_match = _DOI_RE.search(entry)
                     if doi_match:
                         cleaned = _clean_doi(doi_match.group(1))
@@ -991,7 +1163,6 @@ def extract_dois_from_pdf(pdf_path: Path) -> List[str]:
                             all_dois.add(cleaned)
                             continue
 
-                    # 正则没找到 → Crossref 查询
                     resolved = _resolve_doi_via_crossref(entry, crossref_session)
                     if resolved:
                         cleaned = _clean_doi(resolved)
@@ -1001,10 +1172,8 @@ def extract_dois_from_pdf(pdf_path: Path) -> List[str]:
                     else:
                         crossref_failed += 1
 
-                    # 每次查询后短暂等待，遵守 Crossref 速率限制
                     time.sleep(0.3)
 
-                    # 每 10 条输出一次进度
                     if (i + 1) % 10 == 0:
                         logger.info(
                             f"[dim]    Crossref 查询进度: {i + 1}/{len(entries)} "
@@ -1029,60 +1198,241 @@ def extract_dois_from_pdf(pdf_path: Path) -> List[str]:
     return list(all_dois)
 
 
-def get_seed_dois() -> List[str]:
-    """先从 todo 文件夹的 PDF 中提取 DOI，如果没有则使用默认 SEED_DOIS。"""
-    seeds = set()
-    if TODO_DIR.exists():
-        pdf_files = list(TODO_DIR.glob("*.pdf"))
-        if pdf_files:
-            logger.info(f"[cyan]从 {TODO_DIR.name} 文件夹中找到 {len(pdf_files)} 个 PDF 文件，正在提取 DOI...[/]")
-            for pdf in pdf_files:
-                extracted = extract_dois_from_pdf(pdf)
-                if extracted:
-                    # 我们通常认为 PDF 文本中出现的最早的 DOI 极有可能是文章本身的 DOI，或者是相关的
-                    # 为了种子，我们把出现的所有合法 DOI 都当作种子（或者只取第一个）
-                    # 考虑到种子需要准确，我们直接全加入种子池让网络过滤。
-                    seeds.update(extracted)
-                    logger.info(f"[dim]  从 {pdf.name} 提取了 {len(extracted)} 个潜在 DOI[/]")
+def _extract_title_abstract_from_pdf(pdf_path: Path) -> Tuple[str, str]:
+    """
+    使用 PyMuPDF 从 PDF 前几页提取标题和摘要。
+    标题：取第一页首几行非空文本（通常是最大字号）。
+    摘要：从前 3 页中提取 Abstract 段落，若无则取前 500 字。
+    """
+    if fitz is None:
+        return pdf_path.stem, ""
+    try:
+        doc = fitz.open(str(pdf_path))
+        # 提取前 3 页文本
+        pages_text = []
+        for i, page in enumerate(doc):
+            if i >= 3:
+                break
+            pages_text.append(page.get_text())
+        doc.close()
+
+        all_text = "\n".join(pages_text)
+        if not all_text.strip():
+            return pdf_path.stem, ""
+
+        # 标题：取第一页前几行非空行
+        first_page_lines = [l.strip() for l in pages_text[0].split("\n") if l.strip()]
+        title = " ".join(first_page_lines[:3]) if first_page_lines else pdf_path.stem
+        # 限制标题长度
+        if len(title) > 200:
+            title = title[:200]
+
+        # 摘要：尝试找 Abstract 段落
+        abstract = ""
+        abstract_match = re.search(
+            r'(?i)\babstract\b[.:\s]*(.+?)(?=\n\s*(?:keywords?|introduction|1[.\s]|I[.\s]))',
+            all_text, re.DOTALL
+        )
+        if abstract_match:
+            abstract = abstract_match.group(1).strip()
+            abstract = ' '.join(abstract.split())  # 清理多余空白
+        else:
+            # 回退：取开头 500 字
+            abstract = ' '.join(all_text[:1500].split())
+
+        # 限制摘要长度
+        if len(abstract) > 1000:
+            abstract = abstract[:1000]
+
+        return title, abstract
+    except Exception as e:
+        logger.warning(f"[yellow]从 PDF 提取标题/摘要失败 ({pdf_path.name}): {e}[/]")
+        return pdf_path.stem, ""
+
+
+def process_seed_papers(
+    db: 'PaperDatabase',
+    evaluator: 'RelevanceEvaluator',
+    topics: List[Dict[str, str]],
+) -> List[str]:
+    """
+    增量扫描 todo/ 文件夹中的 PDF，仅处理新增/变更的文件。
+    通过 processed_seeds 表中的文件指纹跟踪已处理状态。
+
+    流程：
+      1. 遍历 todo/ 中所有 PDF，计算指纹
+      2. 跳过指纹已在 processed_seeds 表中的文件
+      3. 对新文件：提取标题 + 摘要 → 多主题评估 → 分类复制 → 提取 DOI
+      4. 处理完成后标记到 processed_seeds 表
     
-    if not seeds:
-        logger.info("[yellow]未从 todo 文件夹提取到 DOI，使用默认种子...[/]")
-        seeds.update(DEFAULT_SEED_DOIS)
-        
+    返回: 所有新提取到的种子 DOI 列表
+    """
+    import shutil
+
+    seeds: set = set()
+
+    if not TODO_DIR.exists():
+        logger.warning(f"[yellow]todo 文件夹不存在: {TODO_DIR}[/]")
+        return []
+
+    pdf_files = list(TODO_DIR.glob("*.pdf"))
+    if not pdf_files:
+        logger.info(f"[dim]todo 文件夹为空: {TODO_DIR}[/]")
+        return []
+
+    # ── 增量过滤：计算指纹，跳过已处理文件 ──
+    new_pdfs: List[Tuple[Path, str]] = []  # (path, file_hash)
+    skipped = 0
+    for pdf in pdf_files:
+        try:
+            file_hash = PaperDatabase.compute_seed_hash(pdf)
+            if db.is_seed_processed(file_hash):
+                skipped += 1
+            else:
+                new_pdfs.append((pdf, file_hash))
+        except Exception as e:
+            logger.warning(f"[yellow]计算文件指纹失败 ({pdf.name}): {e}[/]")
+            new_pdfs.append((pdf, ""))  # 无法计算指纹则视为新文件
+
+    if skipped > 0:
+        logger.info(f"[dim]📂 todo/ 共 {len(pdf_files)} 个 PDF，其中 {skipped} 个已处理过，跳过[/]")
+
+    if not new_pdfs:
+        logger.info(f"[dim]📂 todo/ 中没有新的种子文献需要处理[/]")
+        return []
+
+    logger.info(f"[cyan]📂 发现 {len(new_pdfs)} 个新输入文献，开始评估并分类...[/]")
+
+    for idx, (pdf, file_hash) in enumerate(new_pdfs, 1):
+        console.rule(f"[bold]输入文献 {idx}/{len(new_pdfs)}: {pdf.name}")
+
+        # 1. 提取标题和摘要
+        title, abstract = _extract_title_abstract_from_pdf(pdf)
+        logger.info(f"[white]  📄 标题: {title[:80]}{'...' if len(title) > 80 else ''}[/]")
+        if abstract:
+            logger.info(f"[dim]  📝 摘要: {abstract[:100]}...[/]")
+
+        # 2. 多主题评估
+        score, best_topic, reason = evaluator.evaluate_multi(title, abstract, topics)
+
+        # 3. 分类并复制
+        if score >= 7:
+            sub_dir = "core_papers"
+        elif score >= 5:
+            sub_dir = "relevant_papers"
+        else:
+            sub_dir = "relevant_papers"  # 输入文献至少保留
+
+        dest_dir = STORAGE_ROOT / best_topic / sub_dir
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_file = dest_dir / pdf.name
+
+        if not dest_file.exists():
+            shutil.copy2(str(pdf), str(dest_file))
+            logger.info(
+                f"[green]  ✓ 已分类: {pdf.name} → {best_topic}/{sub_dir}/ (score={score}/10)[/]"
+            )
+        else:
+            logger.info(
+                f"[dim]  ℹ️ 已存在: {best_topic}/{sub_dir}/{pdf.name}，跳过复制[/]"
+            )
+
+        # 4. 提取 DOI 作为种子
+        extracted_dois = extract_dois_from_pdf(pdf)
+        doi_count = len(extracted_dois)
+        if extracted_dois:
+            seeds.update(extracted_dois)
+            logger.info(f"[cyan]  🔗 从 {pdf.name} 提取了 {doi_count} 个种子 DOI[/]")
+
+        # 5. 标记为已处理
+        if file_hash:
+            try:
+                file_size = pdf.stat().st_size
+            except Exception:
+                file_size = 0
+            db.mark_seed_processed(
+                file_hash=file_hash,
+                filename=pdf.name,
+                file_size=file_size,
+                best_topic=best_topic,
+                score=score,
+                doi_count=doi_count,
+            )
+
+    logger.info(f"[green]✓ 输入文献处理完成: {len(new_pdfs)} 篇新文献已分类, {len(seeds)} 个种子 DOI[/]")
+    total_seeds = db.count_processed_seeds()
+    logger.info(f"[dim]  累计已处理种子文件: {total_seeds} 个[/]")
     return list(seeds)
 
 
-def main():
-    """PaperHarvester 主入口。"""
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║              快捷方式创建 (Windows)                                ║
+# ╚══════════════════════════════════════════════════════════════════╝
 
-    # 确保文件夹存在
+def _create_shortcut(target_path: Path, shortcut_path: Path):
+    """在 Windows 上创建 .lnk 快捷方式（通过 PowerShell）。"""
+    if sys.platform != "win32":
+        logger.warning("[yellow]快捷方式仅在 Windows 上支持[/]")
+        return
+    try:
+        ps_script = (
+            f'$ws = New-Object -ComObject WScript.Shell; '
+            f'$sc = $ws.CreateShortcut("{shortcut_path}"); '
+            f'$sc.TargetPath = "{target_path}"; '
+            f'$sc.Save()'
+        )
+        subprocess.run(
+            ["powershell", "-Command", ps_script],
+            capture_output=True, timeout=10,
+        )
+        logger.info(f"[green]  ✓ 已创建快捷方式: {shortcut_path.name} → {target_path}[/]")
+    except Exception as e:
+        logger.warning(f"[yellow]  ⚠ 创建快捷方式失败: {e}[/]")
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║                      主 循 环  main()                            ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+def main():
+    """PaperHarvester 主入口（多主题版）。"""
+
+    # ── 创建存储目录结构 ──
     TODO_DIR.mkdir(parents=True, exist_ok=True)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    
+    for topic in TOPICS:
+        topic_name: str = topic["name"]
+        (STORAGE_ROOT / topic_name / "core_papers").mkdir(parents=True, exist_ok=True)
+        (STORAGE_ROOT / topic_name / "relevant_papers").mkdir(parents=True, exist_ok=True)
+
+    # ── 创建快捷方式（如果存储路径是外部路径） ──
+    if _storage_path_raw and STORAGE_ROOT != BASE_DIR:
+        shortcut_file = BASE_DIR / "文献库.lnk"
+        if not shortcut_file.exists():
+            _create_shortcut(STORAGE_ROOT, shortcut_file)
+
+    # ── 构建主题摘要文本 ──
+    topics_summary = " | ".join(t["name"] for t in TOPICS)
+
     # ── 启动横幅 ──
     console.print(
         Panel(
-            f"[bold white]课题:[/] [yellow]{TOPIC_DESCRIPTION}[/]\n"
-            f"[bold white]目标下载:[/] [green]{TARGET_DOWNLOAD_COUNT} 篇[/]  |  [bold white]种子获取来源:[/] [cyan]{TODO_DIR.name}/[/]\n"
-            f"[bold white]下载目录:[/] [cyan]{OUTPUT_DIR.name}/[/]",
-            title="[bold blue]PaperHarvester — 自动化文献滚雪球检索系统[/]",
+            f"[bold white]研究方向:[/] [yellow]{topics_summary}[/]\n"
+            f"[bold white]目标下载:[/] [green]{TARGET_DOWNLOAD_COUNT} 篇[/]  |  [bold white]种子来源:[/] [cyan]{TODO_DIR}[/]\n"
+            f"[bold white]存储根目录:[/] [cyan]{STORAGE_ROOT}[/]",
+            title="[bold blue]PaperHarvester — 多主题自动化文献滚雪球检索系统[/]",
             expand=False,
         )
     )
 
     # ── 加载 API Key ──
     load_dotenv(ENV_PATH, override=True)
-    # .env 文件可能直接是裸 key（没有变量名），也可能是 DEEPSEEK_API_KEY=xxx
     api_key = os.getenv("DEEPSEEK_API_KEY")
     if not api_key:
-        # 尝试直接读取 .env 文件内容作为 key
         try:
             raw = ENV_PATH.read_text(encoding="utf-8").strip()
-            # 如果文件内容看起来像一个 API key（以 sk- 开头）
             if raw.startswith("sk-"):
                 api_key = raw
             else:
-                # 尝试解析 KEY=VALUE 格式
                 for line in raw.split("\n"):
                     line = line.strip()
                     if line and not line.startswith("#"):
@@ -1098,26 +1448,28 @@ def main():
     if not api_key:
         logger.error("[red]✗ 未找到 DeepSeek API Key！请在 .env 中设置。[/]")
         sys.exit(1)
-        
+
     api_key_str: str = str(api_key)
     logger.info(f"[green]✓ API Key 已加载 (sk-...{api_key_str[-6:]})[/]")
 
     # ── 初始化各模块 ──
-    db = PaperDatabase()
+    db = PaperDatabase(db_path=DB_PATH)
     fetcher = MetadataFetcher()
     evaluator = RelevanceEvaluator(api_key_str)
-    downloader = PaperDownloader(output_dir=OUTPUT_DIR) # Pass output_dir here
+    downloader = PaperDownloader(output_dir=STORAGE_ROOT)
 
-    # ── 步骤 1：插入种子 DOI ──
+    # ── 步骤 1：处理 todo 文件夹中的输入文献（评估 + 分类 + 提取种子DOI） ──
+    seed_dois = process_seed_papers(db, evaluator, TOPICS)
     seed_added_count: int = 0
-    seed_dois = get_seed_dois() # Get DOIs dynamically
     for doi in seed_dois:
         if db.add_doi(doi):
             seed_added_count = int(seed_added_count) + 1
     if seed_added_count > 0:
         logger.info(f"[green]✓ 新增 {seed_added_count} 个种子 DOI 到数据库[/]")
-    else:
+    elif seed_dois:
         logger.info(f"[dim]种子 DOI 已在数据库中（断点续传模式）[/]")
+    else:
+        logger.warning(f"[yellow]⚠ todo 文件夹中未提取到种子 DOI，请在 {TODO_DIR} 中放入 PDF 文献[/]")
 
     print_status_table(db)
 
@@ -1125,7 +1477,7 @@ def main():
     iteration = 0
     start_time = time.time()
     last_active_time = time.time()
-    
+
     try:
         while True:
             # 2a. 检查已下载数量
@@ -1136,19 +1488,32 @@ def main():
 
             # 2b. 检查全局超时
             elapsed = time.time() - start_time
-            if elapsed > MAX_RUNTIME_SEC:
-                logger.warning(f"[yellow]⏰ 已达到全局最大运行时间 ({MAX_RUNTIME_SEC}s)，程序将自动退出以防长时间卡死。[/]")
+            if MAX_RUNTIME_SEC > 0 and elapsed > MAX_RUNTIME_SEC:
+                logger.warning(f"[yellow]⏰ 已达到全局最大运行时间 ({MAX_RUNTIME_SEC}s)，自动退出。[/]")
                 break
 
             # 2c. 检查非活动超时
-            inactive_duration = time.time() - last_active_time
-            if inactive_duration > INACTIVITY_TIMEOUT_SEC:
-                logger.warning(f"[yellow]⏳ 已超过 {INACTIVITY_TIMEOUT_SEC}s 未能成功下载新文献，可能陷入僵局，程序将自动退出。[/]")
-                break
+            if INACTIVITY_TIMEOUT_SEC > 0:
+                inactive_duration = time.time() - last_active_time
+                if inactive_duration > INACTIVITY_TIMEOUT_SEC:
+                    logger.warning(f"[yellow]⏳ 已超过 {INACTIVITY_TIMEOUT_SEC}s 未成功下载，继续下一个...[/]")
+                    last_active_time = time.time()
+
+            # ── 周期性热扫描 todo/ 文件夹（每 50 轮检查一次新种子） ──
+            if iteration > 0 and iteration % 50 == 0:
+                logger.info(f"[cyan]🔄 第 {iteration} 轮：周期性扫描 todo/ 文件夹是否有新种子...[/]")
+                hot_seeds = process_seed_papers(db, evaluator, TOPICS)
+                if hot_seeds:
+                    hot_added = 0
+                    for sdoi in hot_seeds:
+                        if db.add_doi(sdoi):
+                            hot_added += 1
+                    if hot_added > 0:
+                        logger.info(f"[green]  ✓ 热加载新增 {hot_added} 个种子 DOI 到队列[/]")
 
             iteration += 1
 
-            # 2d. 从数据库获取下一个 pending DOI
+            # 2d. 获取下一个 pending DOI
             doi = db.get_next_pending()
             if doi is None:
                 logger.info("[yellow]📭 队列为空，所有候选文献已处理完毕[/]")
@@ -1157,103 +1522,82 @@ def main():
             console.rule(f"[bold]第 {iteration} 轮  |  已下载: {downloaded_count}/{TARGET_DOWNLOAD_COUNT}  |  运行: {int(elapsed)}s")
             logger.info(f"[bold white]📄 处理 DOI: {doi}[/]")
 
-            # 2e. 获取元数据和 Abstract
+            # 2e. 获取元数据
             title, abstract, ref_dois, is_not_found = fetcher.fetch(doi)
 
-            # 更新 DOI 的活跃时间（获取到元数据也算一种进度，但不如成功下载进度强）
-            # 我们这里选择仅在成功下载时刷新 inactivity_timeout_sec，或者在获取到新元数据时也刷新
-            # 考虑到“卡住”通常发生在下载环节，刷新一次元数据获取时间也是合理的
-            if title:
-                # 即使没下载，获取到元数据也证明程序在推进
-                pass 
-
-            # 如果明确找不到元数据，标记为 failed
             if is_not_found:
                 db.update_paper(doi, status="failed")
                 continue
 
-            # 更新数据库中的标题和摘要
             if title:
                 db.update_paper(doi, title=title, abstract=abstract)
 
-            # 如果没拿到元数据且不是因为 404，维持 pending 状态并跳过
             if not title:
-                logger.warning(f"[yellow]  ⚠ 无法获取元数据且非明确 404，跳过此 DOI 保持已更新时间（回退到队尾）[/]")
-                db.update_paper(doi) # 触发 updated_at 更新，使其排到后面
+                logger.warning(f"[yellow]  ⚠ 无法获取元数据，跳过（回退到队尾）[/]")
+                db.update_paper(doi)
                 continue
 
-            # 2f. 调用 DeepSeek 进行打分
-            score, reason = evaluator.evaluate(title, abstract, TOPIC_DESCRIPTION)
+            # 2f. 多主题评估
+            score, best_topic, reason = evaluator.evaluate_multi(title, abstract, TOPICS)
 
-            # 更新评分到数据库
-            db.update_paper(doi, relevance_score=score)
+            # 更新评分和归属主题到数据库
+            db.update_paper(doi, relevance_score=score, best_topic=best_topic)
 
-            # 2g. 根据评分决定是否下载（10 级评分）
-            #   score ≥ 7 → 核心/高度相关，下载到 core_papers/
-            #   score 5-6 → 中等相关，下载到 relevant_papers/
-            #   score ≤ 4 → 边缘/不相关，不下载
+            # 2g. 根据评分决定是否下载
             if score >= 5:
                 score_dir_name: str = "core_papers" if score >= 7 else "relevant_papers"
-                score_output_dir: Path = OUTPUT_DIR / score_dir_name
+                score_output_dir: Path = STORAGE_ROOT / best_topic / score_dir_name
+                score_output_dir.mkdir(parents=True, exist_ok=True)
                 exit_code = downloader.download(doi, output_dir=score_output_dir)
 
                 success = False
                 if exit_code == 0:
                     db.update_paper(doi, status="downloaded")
                     success = True
-                    last_active_time = time.time() # 核心：成功下载，刷新非活动计时器
+                    last_active_time = time.time()
                 elif exit_code == 2:
                     db.update_paper(doi, status="failed")
                 else:
-                    # 临时失败，保持 pending 但更新 updated_at
-                    logger.info(f"[yellow]  ⚠ 下载遇到临时困难，DOI {doi} 将移至队尾稍后重试[/]")
-                    db.update_paper(doi) 
-                    continue
+                    logger.info(f"[yellow]  ⚠ 下载失败，标记为 failed，继续下一个[/]")
+                    db.update_paper(doi, status="failed")
 
-                # ── 滚雪球逻辑（基于评分的门控） ──
+                # ── 滚雪球逻辑 ──
                 current_depth = db.get_depth(doi)
                 next_depth = current_depth + 1
 
-                # 只有未超过最大深度才继续滚雪球
                 if SNOWBALL_ENABLED and next_depth <= SNOWBALL_MAX_DEPTH:
                     if score >= 7:
-                        # 高相关分支：展开全部引用（API + PDF）
                         if ref_dois:
                             newly_added = db.add_dois_batch(ref_dois, depth=next_depth, parent_score=score)
                             logger.info(
-                                f"[cyan]  📚 [滚雪球 L{next_depth}] API引用文献: 共 {len(ref_dois)} 篇, 新增入库 {newly_added} 篇[/]"
+                                f"[cyan]  📚 [滚雪球 L{next_depth}] API引用: 共 {len(ref_dois)} 篇, 新增 {newly_added} 篇[/]"
                             )
                         if SNOWBALL_FROM_PDF and success:
                             safe_name = doi.replace("/", "_")
                             safe_name = re.sub(r'[<>:"|?*\\]', "_", safe_name)
-                            safe_name_str: str = safe_name
-                            pdf_file = score_output_dir / f"{safe_name_str}.pdf"
+                            pdf_file = score_output_dir / f"{safe_name}.pdf"
                             if pdf_file.exists():
                                 pdf_dois = extract_dois_from_pdf(pdf_file)
                                 pdf_dois = [d for d in pdf_dois if d != doi]
                                 if pdf_dois:
                                     pdf_added = db.add_dois_batch(pdf_dois, depth=next_depth, parent_score=score)
                                     logger.info(
-                                        f"[cyan]  📚 [滚雪球 L{next_depth}] PDF提取引用: 共 {len(pdf_dois)} 篇, 新增入库 {pdf_added} 篇[/]"
+                                        f"[cyan]  📚 [滚雪球 L{next_depth}] PDF引用: 共 {len(pdf_dois)} 篇, 新增 {pdf_added} 篇[/]"
                                     )
                     elif score >= 5:
-                        # 中等相关分支：仅展开 API 引用（不提取 PDF，节省时间）
                         if ref_dois:
                             newly_added = db.add_dois_batch(ref_dois, depth=next_depth, parent_score=score)
                             logger.info(
-                                f"[cyan]  📚 [滚雪球 L{next_depth}] API引用文献(精简): 共 {len(ref_dois)} 篇, 新增入库 {newly_added} 篇[/]"
+                                f"[cyan]  📚 [滚雪球 L{next_depth}] API引用(精简): 共 {len(ref_dois)} 篇, 新增 {newly_added} 篇[/]"
                             )
-                        logger.info(f"[dim]  ℹ️ score={score} 中等相关，跳过 PDF 引用提取以节省时间[/]")
                 elif not SNOWBALL_ENABLED:
-                    logger.info(f"[dim]  ℹ️ 滚雪球已关闭 (配置 snowball.enabled=false)[/]")
+                    logger.info(f"[dim]  ℹ️ 滚雪球已关闭[/]")
                 else:
-                    logger.info(f"[dim]  ℹ️ 已达最大滚雪球深度 {SNOWBALL_MAX_DEPTH}，不再继续提取引用[/]")
+                    logger.info(f"[dim]  ℹ️ 已达最大深度 {SNOWBALL_MAX_DEPTH}[/]")
             else:
-                # score ≤ 4：边缘/不相关，标记为 evaluated，不下载也不展开引用
                 db.update_paper(doi, status="evaluated")
-                logger.info(f"[dim]  ⏭ score={score} ≤ 4，边缘/不相关，跳过下载和引用提取[/]")
+                logger.info(f"[dim]  ⏭ score={score} ≤ 4，跳过下载[/]")
 
-            # 每 10 轮打印一次详细进度
             if iteration % 10 == 0:
                 print_status_table(db)
 
@@ -1261,7 +1605,7 @@ def main():
         console.print("\n")
         logger.info("[yellow]⚡ 用户中断 (Ctrl+C)，正在优雅退出...[/]")
 
-    # ── 结束：打印最终统计 ──
+    # ── 结束统计 ──
     console.print()
     print_status_table(db)
     downloaded = db.count_downloaded()
@@ -1273,12 +1617,13 @@ def main():
     else:
         console.print(Panel.fit(
             f"[bold yellow]📋 已下载 {downloaded}/{TARGET_DOWNLOAD_COUNT} 篇。"
-            f"{'队列为空。' if db.get_next_pending() is None else '程序中断，可重新运行继续。'}[/]",
+            f"{'队列为空。' if db.get_next_pending() is None else '可重新运行继续。'}[/]",
             border_style="yellow",
         ))
 
     db.close()
     logger.info("[dim]数据库连接已关闭，程序退出。[/]")
+
 
 
 if __name__ == "__main__":

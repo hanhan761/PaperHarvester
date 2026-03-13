@@ -1,14 +1,21 @@
 {
-    "topic_description": "火箭发动机设计",
+    "storage_path": "D:\\AF背景调研",
     "target_download_count": 5000,
-    "seed_dois": [
-        "10.2514/1.B38364",
-        "10.1016/j.actaastro.2021.01.032"
+    "topics": [
+        {
+            "name": "液体火箭发动机组件与参数化设计",
+            "description": "液体火箭发动机各核心组件的工程设计与参数化方法。包括推力室热力学循环分析（室压、混合比、膨胀比、循环方案选择），Rao Bell/TIC 喷管型面参数化设计，再生冷却通道构型与流道布局，喷注器设计（离心式/同轴剪切式/撞击式），涡轮泵通流设计与叶型生成，增材制造(SLM/LPBF)金属推力室的材料选型(GRCop-42/Inconel-718)与可制造性约束(DFAM)，以及系统级功率平衡与组件间参数匹配。"
+        },
+        {
+            "name": "多物理场耦合仿真与PINN求解",
+            "description": "火箭发动机极端工况下的多物理场耦合仿真与智能求解方法。涵盖共轭传热(CHT)求解（Bartz关联式、再生冷却壁温场），流固耦合(FSI)与热应力分析，极端热梯度下的低周疲劳(LCF)寿命预测（Coffin-Manson、棘轮效应），燃烧流场CFD与喷管激波分离侧载，深节流沸腾相变检测，物理信息神经网络(PINN)求解传热/力学PDE及替代模型(Surrogate/ROM)加速，Monte-Carlo概率设计分析与鲁棒优化，以及多学科设计优化(MDO)框架。"
+        },
+        {
+            "name": "基于隐式张量场的生成式几何建模与编译",
+            "description": "基于符号距离场(SDF)隐式几何表示的生成式设计与自动化几何编译。包括SDF张量场中的CSG布尔运算（光滑并集/差集/交集），参数化SDF基元构建复杂工程拓扑（喷管内腔、泪滴形微通道、法兰、歧管），Marching Cubes等值面提取与Taubin保体积网格平滑，SDF/隐式几何到B-rep(STEP/IGES)工业标准CAD的转换，神经隐式表示(Neural SDF/DeepSDF/NeRF)在工程几何中的应用，以及从声明式设计意图到可制造网格的端到端自动化编译管线。"
+        }
     ],
     "paths": {
-        "todo_dir": "todo",
-        "output_dir": "output",
-        "db_file": "papers.db",
         "download_script": "src/download_single.py",
         "env_file": ".env"
     },
@@ -20,10 +27,10 @@
     },
     "timeouts": {
         "http_timeout_sec": 30,
-        "download_subprocess_timeout_sec": 300,
+        "download_subprocess_timeout_sec": 60,
         "api_call_interval_sec": 1.5,
-        "max_runtime_sec": 3600,
-        "inactivity_timeout_sec": 600
+        "max_runtime_sec": 0,
+        "inactivity_timeout_sec": 0
     },
     "snowball": {
         "enabled": true,
