@@ -42,6 +42,11 @@ from rich.logging import RichHandler
 from rich.table import Table
 from rich.panel import Panel
 
+try:
+    import fitz  # PyMuPDF
+except ImportError:
+    fitz = None
+
 # ── 自定义异常 ──
 class MetadataTransientError(Exception):
     """网络超时或临时服务器错误，应保留 pending 状态重试。"""
@@ -194,7 +199,7 @@ class PaperDatabase:
         self._create_table()
 
     def _create_table(self):
-        """创建 papers 表（如不存在）"""
+        """创建 papers 表（如不存在），并自动迁移旧表结构。"""
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS papers (
                 doi         TEXT PRIMARY KEY,
@@ -203,15 +208,24 @@ class PaperDatabase:
                 relevance_score INTEGER DEFAULT 0,
                 status      TEXT DEFAULT 'pending',
                 depth       INTEGER DEFAULT 0,
+                parent_score INTEGER DEFAULT 5,
                 added_at    TEXT DEFAULT '',
                 updated_at  TEXT DEFAULT ''
             )
         """)
         self.conn.commit()
+        # 自动迁移：如果旧表缺少 parent_score 列，自动添加
+        try:
+            self.conn.execute("SELECT parent_score FROM papers LIMIT 1")
+        except sqlite3.OperationalError:
+            self.conn.execute("ALTER TABLE papers ADD COLUMN parent_score INTEGER DEFAULT 5")
+            self.conn.commit()
+            logger.info("[dim]数据库迁移：已添加 parent_score 列[/]")
 
-    def add_doi(self, doi: str, depth: int = 0) -> bool:
+    def add_doi(self, doi: str, depth: int = 0, parent_score: int = 5) -> bool:
         """
         添加新 DOI 到数据库（状态为 pending）。
+        parent_score: 父文献的相关性评分，用于队列优先级排序。
         如果 DOI 已存在则静默忽略，返回 False。
         """
         doi = doi.strip()
@@ -220,8 +234,8 @@ class PaperDatabase:
         now = datetime.now().isoformat()
         try:
             self.conn.execute(
-                "INSERT INTO papers (doi, status, depth, added_at, updated_at) VALUES (?, 'pending', ?, ?, ?)",
-                (doi, depth, now, now),
+                "INSERT INTO papers (doi, status, depth, parent_score, added_at, updated_at) VALUES (?, 'pending', ?, ?, ?, ?)",
+                (doi, depth, parent_score, now, now),
             )
             self.conn.commit()
             return True
@@ -229,9 +243,10 @@ class PaperDatabase:
             # DOI 已存在，静默忽略
             return False
 
-    def add_dois_batch(self, dois: List[str], depth: int = 0) -> int:
+    def add_dois_batch(self, dois: List[str], depth: int = 0, parent_score: int = 5) -> int:
         """
         批量添加 DOI 列表，返回实际新增数量。
+        parent_score: 父文献的相关性评分，用于队列优先级排序。
         """
         added_count: int = 0
         now = datetime.now().isoformat()
@@ -241,8 +256,8 @@ class PaperDatabase:
                 continue
             try:
                 self.conn.execute(
-                    "INSERT INTO papers (doi, status, depth, added_at, updated_at) VALUES (?, 'pending', ?, ?, ?)",
-                    (doi, depth, now, now),
+                    "INSERT INTO papers (doi, status, depth, parent_score, added_at, updated_at) VALUES (?, 'pending', ?, ?, ?, ?)",
+                    (doi, depth, parent_score, now, now),
                 )
                 added_count = int(added_count) + 1
             except sqlite3.IntegrityError:
@@ -253,11 +268,12 @@ class PaperDatabase:
     def get_next_pending(self) -> Optional[str]:
         """
         获取下一个状态为 pending 的 DOI。
-        按添加时间排序，优先处理较早的条目。
+        优先级排序：parent_score DESC (高相关分支优先) → depth ASC → updated_at ASC
         返回 DOI 字符串或 None（队列为空时）。
         """
         cursor = self.conn.execute(
-            "SELECT doi FROM papers WHERE status = 'pending' ORDER BY depth ASC, updated_at ASC LIMIT 1"
+            "SELECT doi FROM papers WHERE status = 'pending' "
+            "ORDER BY parent_score DESC, depth ASC, updated_at ASC LIMIT 1"
         )
         row = cursor.fetchone()
         return row[0] if row else None
@@ -519,7 +535,7 @@ class RelevanceEvaluator:
         })
 
     def _build_prompt(self, title: str, abstract: str, topic: str) -> str:
-        """构造给 DeepSeek 的精密评估 Prompt。"""
+        """构造给 DeepSeek 的精密评估 Prompt（10 级评分）。"""
         return f"""你是一位学术文献相关性评估专家。请根据以下信息，判断该论文与目标研究课题的相关程度。
 
 【目标研究课题】
@@ -529,15 +545,17 @@ class RelevanceEvaluator:
 标题: {title}
 摘要: {abstract if abstract else '（摘要缺失，请仅根据标题判断）'}
 
-【评分标准】
-- 1 分 (Highly Relevant): 论文直接研究目标课题的核心问题，包含关键方法或实验数据。
-- 2 分 (Somewhat Relevant): 论文涉及目标课题的相关技术、材料或背景知识，可提供参考价值。
-- 3 分 (Irrelevant): 论文与目标课题无关或仅有极其微弱的间接联系。
+【评分标准 (1-10)】
+- 9~10 分: 核心相关，论文直接研究目标课题的核心问题（如关键设计方法、实验验证、性能优化）。
+- 7~8 分: 高度相关，论文涉及目标课题的重要子领域或关键支撑技术。
+- 5~6 分: 中等相关，论文提供了与课题相关的基础理论、背景知识或通用方法。
+- 3~4 分: 边缘相关，论文仅有间接的技术或领域联系，参考价值有限。
+- 1~2 分: 不相关，论文与目标课题无实质性联系。
 
 【输出要求】
 你必须且只能输出一个 JSON 对象，不要输出任何其他文字、解释或 Markdown 格式。
 格式如下:
-{{"score": <1或2或3>, "reason": "<简短理由，不超过50字>"}}"""
+{{"score": <1到10的整数>, "reason": "<简短理由，不超过50字>"}}"""
 
     @retry(
         stop=stop_after_attempt(3),
@@ -583,31 +601,31 @@ class RelevanceEvaluator:
                     cleaned = cleaned[first_newline + 1 :].strip()
 
             result = json.loads(cleaned)
-            score = int(result.get("score", 2))
+            score = int(result.get("score", 5))
             reason = str(result.get("reason", "无"))
 
-            # 确保 score 在有效范围内
-            if score not in (1, 2, 3):
-                logger.warning(f"[yellow]  ⚠ 评分 {score} 超出范围，修正为 2[/]")
-                score = 2
+            # 确保 score 在有效范围 1-10 内
+            if score < 1 or score > 10:
+                logger.warning(f"[yellow]  ⚠ 评分 {score} 超出 1-10 范围，修正为 5[/]")
+                score = max(1, min(10, score))
 
             return score, reason
 
         except (json.JSONDecodeError, ValueError, KeyError, TypeError) as e:
             raw_str = str(raw) if raw else ""
             logger.warning(
-                f"[yellow]  ⚠ DeepSeek 回复解析失败 ({type(e).__name__}), 默认 score=2。原始回复: {raw_str[:100]}[/]"
+                f"[yellow]  ⚠ DeepSeek 回复解析失败 ({type(e).__name__}), 默认 score=5。原始回复: {raw_str[:100]}[/]"
             )
-            return 2, f"解析失败，默认评分 (原始: {raw_str[:80]})"
+            return 5, f"解析失败，默认评分 (原始: {raw_str[:80]})"
 
     def evaluate(self, title: str, abstract: str, topic: str) -> Tuple[int, str]:
         """
-        评估论文相关性。
-        返回: (score, reason)
-        如果 API 调用完全失败，也返回 (2, reason) 以保证流程不中断。
+        评估论文相关性（10 级评分）。
+        返回: (score, reason)  score ∈ [1, 10]
+        如果 API 调用完全失败，返回 (5, reason) 保守处理。
         """
         if not title and not abstract:
-            return 2, "标题和摘要均缺失，无法评估，默认部分相关"
+            return 5, "标题和摘要均缺失，无法评估，默认中等相关"
 
         prompt = self._build_prompt(title, abstract, topic)
 
@@ -615,15 +633,24 @@ class RelevanceEvaluator:
             logger.info(f"[magenta]🤖 DeepSeek 评估相关性...[/]")
             raw_response = self._call_deepseek(prompt)
             score, reason = self._parse_response(raw_response)
-            score_labels = {1: "🔴 核心相关", 2: "🟡 部分相关", 3: "⚪ 不相关"}
-            label = score_labels.get(score, "未知")
-            logger.info(f"[magenta]  → {label} (score={score}): {reason}[/]")
+            # 10 级标签
+            if score >= 9:
+                label = "🔴 核心相关"
+            elif score >= 7:
+                label = "🟠 高度相关"
+            elif score >= 5:
+                label = "🟡 中等相关"
+            elif score >= 3:
+                label = "🔵 边缘相关"
+            else:
+                label = "⚪ 不相关"
+            logger.info(f"[magenta]  → {label} (score={score}/10): {reason}[/]")
             time.sleep(API_CALL_INTERVAL)
             return score, reason
 
         except Exception as e:
             logger.error(f"[red]  ✗ DeepSeek API 调用失败: {type(e).__name__}: {e}[/]")
-            return 2, f"API 调用失败 ({type(e).__name__})，默认部分相关"
+            return 5, f"API 调用失败 ({type(e).__name__})，默认中等相关"
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -720,27 +747,286 @@ def print_status_table(db: PaperDatabase):
     table.add_row("[bold]总计[/]", f"[bold]{db.total_count()}[/]")
     console.print(table)
 
-def extract_dois_from_pdf(pdf_path: Path) -> List[str]:
-    """从本地 PDF 文件内容中正则匹配提取 DOI。"""
+# ── DOI 正则：清理并校验一个候选 DOI 字符串 ──
+_DOI_RE = re.compile(r'(10\.\d{4,9}/[^\s"\',;<>\]\)}{]+)')
+
+def _clean_doi(raw: str) -> Optional[str]:
+    """清理候选 DOI 字符串，去掉尾部垃圾字符并做基本校验。"""
+    doi = raw.strip()
+    # 去掉 URL 参数（如 &domain=pdf）
+    doi = re.sub(r'[&?].*$', '', doi)
+    # 去掉尾部常见的非 DOI 字符
+    doi = re.sub(r'[.,;:)\]}]+$', '', doi)
+    # 去掉末尾可能粘上的 PDF 元数据噪声
+    doi = re.sub(r'\\[a-zA-Z]+$', '', doi)
+    if len(doi) > 8 and '/' in doi and not doi.endswith('/'):
+        return doi
+    return None
+
+
+def _extract_full_text_from_pdf(pdf_path: Path) -> str:
+    """
+    使用 PyMuPDF (fitz) 从 PDF 中逐页提取文本。
+    如果 PyMuPDF 不可用则返回空字符串。
+    """
+    if fitz is None:
+        logger.warning("[yellow]PyMuPDF 未安装，无法提取 PDF 文本。请运行: pip install PyMuPDF[/]")
+        return ""
+    try:
+        doc = fitz.open(str(pdf_path))
+        pages_text: List[str] = []
+        for page in doc:
+            pages_text.append(page.get_text())
+        doc.close()
+        return "\n".join(pages_text)
+    except Exception as e:
+        logger.warning(f"[yellow]PyMuPDF 提取文本失败 ({pdf_path.name}): {e}[/]")
+        return ""
+
+
+def _find_references_section(full_text: str) -> str:
+    """
+    从全文中定位参考文献节。
+    策略：反向搜索常见参考文献标题的最后一次出现位置。
+    返回参考文献节的文本（从标题行之后开始）。
+    """
+    if not full_text:
+        return ""
+
+    # 多种可能的标题格式（含可选的编号前缀和换行）
+    # 例如: "References", "REFERENCES", "8. References", "VI. REFERENCES", "参考文献"
+    heading_patterns = [
+        r'(?:^|\n)\s*(?:[0-9IVXLC]+\.?\s+)?References\s*(?:\n|$)',
+        r'(?:^|\n)\s*(?:[0-9IVXLC]+\.?\s+)?REFERENCES\s*(?:\n|$)',
+        r'(?:^|\n)\s*(?:[0-9IVXLC]+\.?\s+)?Bibliography\s*(?:\n|$)',
+        r'(?:^|\n)\s*(?:[0-9IVXLC]+\.?\s+)?BIBLIOGRAPHY\s*(?:\n|$)',
+        r'(?:^|\n)\s*参考文献\s*(?:\n|$)',
+    ]
+
+    last_pos = -1
+    last_end = -1
+    for pattern in heading_patterns:
+        for match in re.finditer(pattern, full_text):
+            if match.start() > last_pos:
+                last_pos = match.start()
+                last_end = match.end()
+
+    if last_pos == -1:
+        return ""
+
+    ref_text = full_text[last_end:]
+
+    # 尝试截断末尾可能的附录/致谢/作者简介等
+    cutoff_patterns = [
+        r'(?:^|\n)\s*(?:[0-9IVXLC]+\.?\s+)?(?:Appendix|APPENDIX|Acknowledgment|ACKNOWLEDGMENT|Acknowledgement|ACKNOWLEDGEMENT)',
+        r'(?:^|\n)\s*(?:Author |About the Author)',
+    ]
+    earliest_cutoff = len(ref_text)
+    for pattern in cutoff_patterns:
+        match = re.search(pattern, ref_text)
+        if match and match.start() < earliest_cutoff:
+            earliest_cutoff = match.start()
+
+    ref_text = ref_text[:earliest_cutoff].strip()
+    return ref_text
+
+
+def _parse_reference_entries(ref_text: str) -> List[str]:
+    """
+    将参考文献文本拆分为独立的引用条目列表。
+    支持格式:
+      - [1] Author, Title...      (方括号编号)
+      - 1. Author, Title...       (数字+点)
+      - 1Author, Title...         (上标数字，直接跟作者名)
+      - {1} Author, Title...      (花括号编号)
+    如果都不匹配，则按段落（双换行）拆分。
+    """
+    if not ref_text.strip():
+        return []
+
+    entries: List[str] = []
+
+    # 策略 1: [N] 格式
+    pattern_bracket = re.compile(r'(?:^|\n)\s*\[\d+\]')
+    splits_bracket = list(pattern_bracket.finditer(ref_text))
+
+    # 策略 2: N. 格式 (行首数字+点)
+    pattern_dot = re.compile(r'(?:^|\n)\s*\d{1,3}\.\s')
+    splits_dot = list(pattern_dot.finditer(ref_text))
+
+    # 策略 3: N 上标格式 (行首数字直接跟大写字母/作者名)
+    pattern_superscript = re.compile(r'(?:^|\n)\s*\d{1,3}[A-Z][a-z]')
+    splits_superscript = list(pattern_superscript.finditer(ref_text))
+
+    # 选择匹配数量最多的策略（≥3 条才认为有效）
+    best_splits = []
+    for candidate in [splits_bracket, splits_dot, splits_superscript]:
+        if len(candidate) > len(best_splits):
+            best_splits = candidate
+
+    if len(best_splits) >= 3:
+        # 根据匹配位置切分
+        for i, m in enumerate(best_splits):
+            start = m.start()
+            end = best_splits[i + 1].start() if i + 1 < len(best_splits) else len(ref_text)
+            entry = ref_text[start:end].strip()
+            # 去掉编号前缀，保留纯引用文本
+            entry = re.sub(r'^\s*\[?\d+\]?\.?\s*', '', entry)
+            entry = ' '.join(entry.split())  # 合并多余空白/换行
+            if len(entry) > 10:  # 过短的丢弃
+                entries.append(entry)
+    else:
+        # 兜底：按段落拆分
+        paragraphs = re.split(r'\n\s*\n', ref_text)
+        for p in paragraphs:
+            p = ' '.join(p.split()).strip()
+            if len(p) > 20:
+                entries.append(p)
+
+    return entries
+
+
+def _resolve_doi_via_crossref(query_text: str, session: requests.Session) -> Optional[str]:
+    """
+    使用 Crossref 的 query.bibliographic 查询，将一条引用文本解析为 DOI。
+    返回最佳匹配的 DOI 或 None。
+    """
+    # 截取前 200 个字符作为查询（太长会影响 API 效果）
+    query = query_text[:200].strip()
+    if len(query) < 15:
+        return None
+
+    url = f"{CROSSREF_API}"
+    params = {
+        "query.bibliographic": query,
+        "rows": 1,
+        "select": "DOI,title,score",
+    }
+    try:
+        resp = session.get(url, params=params, timeout=15)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        items = data.get("message", {}).get("items", [])
+        if not items:
+            return None
+
+        best = items[0]
+        score = best.get("score", 0)
+        # Crossref 的 score 一般 >50 表示较好的匹配
+        # 为避免误匹配，设置最低阈值
+        if score < 30:
+            return None
+
+        return best.get("DOI")
+    except Exception:
+        return None
+
+
+def _extract_dois_binary_fallback(pdf_path: Path) -> List[str]:
+    """原始二进制正则兜底方案：直接扫描 PDF 字节流。"""
     dois = set()
     try:
         with open(pdf_path, 'rb') as f:
             content = f.read()
-            # 常见 DOI 正则表达式
-            # 匹配 10. 开头，且不再贪婪捕获括号和标点
             matches = re.findall(br'(10\.\d{4,9}/[^\s"\'<>]+)', content)
             for m in matches:
                 try:
                     doi_str = m.decode('utf-8', errors='ignore')
-                    # 严格清理尾部常见的无意义字符，特别是导致 bug 的右括号或点号
-                    doi_str = re.sub(r'[.,;:)\]}]+$', '', doi_str)
-                    if len(doi_str) > 8 and '/' in doi_str:
-                        dois.add(doi_str)
+                    cleaned = _clean_doi(doi_str)
+                    if cleaned:
+                        dois.add(cleaned)
                 except Exception:
                     pass
-    except Exception as e:
-        logger.warning(f"[yellow]无法读取 PDF {pdf_path.name}: {e}[/]")
+    except Exception:
+        pass
     return list(dois)
+
+
+def extract_dois_from_pdf(pdf_path: Path) -> List[str]:
+    """
+    从 PDF 文件中提取参考文献的 DOI 列表（多策略）。
+
+    策略优先级：
+      1. PyMuPDF 提取全文 → 定位 References 节 → 拆分引用条目
+         a. 正则提取条目中已有的 DOI
+         b. Crossref 查询将纯文本引用解析为 DOI
+      2. 二进制正则扫描 PDF 字节流（兜底）
+    """
+    all_dois: set = set()
+
+    # ── 策略 1: PyMuPDF 文本提取 ──
+    full_text = _extract_full_text_from_pdf(pdf_path)
+    if full_text:
+        # 1a. 先从全文中正则提取所有 DOI（包括正文中引用的 DOI 链接）
+        for m in _DOI_RE.finditer(full_text):
+            cleaned = _clean_doi(m.group(1))
+            if cleaned:
+                all_dois.add(cleaned)
+
+        text_doi_count = len(all_dois)
+        logger.info(f"[cyan]  📄 PDF 全文 DOI 正则: 找到 {text_doi_count} 个[/]")
+
+        # 1b. 定位 References 节并拆分引用条目
+        ref_text = _find_references_section(full_text)
+        if ref_text:
+            entries = _parse_reference_entries(ref_text)
+            logger.info(f"[cyan]  📚 References 节: 识别到 {len(entries)} 条引用[/]")
+
+            if entries:
+                # 对每条引用：先尝试正则提取 DOI，没有则用 Crossref 查询
+                crossref_session = requests.Session()
+                crossref_session.headers.update({
+                    "User-Agent": "PaperHarvester/1.0 (Academic Research Tool; mailto:research@example.com)"
+                })
+                crossref_resolved = 0
+                crossref_failed = 0
+
+                for i, entry in enumerate(entries):
+                    # 先正则提取
+                    doi_match = _DOI_RE.search(entry)
+                    if doi_match:
+                        cleaned = _clean_doi(doi_match.group(1))
+                        if cleaned:
+                            all_dois.add(cleaned)
+                            continue
+
+                    # 正则没找到 → Crossref 查询
+                    resolved = _resolve_doi_via_crossref(entry, crossref_session)
+                    if resolved:
+                        cleaned = _clean_doi(resolved)
+                        if cleaned:
+                            all_dois.add(cleaned)
+                            crossref_resolved += 1
+                    else:
+                        crossref_failed += 1
+
+                    # 每次查询后短暂等待，遵守 Crossref 速率限制
+                    time.sleep(0.3)
+
+                    # 每 10 条输出一次进度
+                    if (i + 1) % 10 == 0:
+                        logger.info(
+                            f"[dim]    Crossref 查询进度: {i + 1}/{len(entries)} "
+                            f"(成功 {crossref_resolved}, 失败 {crossref_failed})[/]"
+                        )
+
+                logger.info(
+                    f"[cyan]  🔗 Crossref 解析完成: 成功 {crossref_resolved}, "
+                    f"失败 {crossref_failed}[/]"
+                )
+        else:
+            logger.warning(f"[yellow]  ⚠ 未能在 PDF 中定位 References 节[/]")
+
+    # ── 策略 2: 二进制正则兜底 ──
+    binary_dois = _extract_dois_binary_fallback(pdf_path)
+    pre_count = len(all_dois)
+    all_dois.update(binary_dois)
+    if len(all_dois) > pre_count:
+        logger.info(f"[dim]  📎 二进制正则兜底新增 {len(all_dois) - pre_count} 个 DOI[/]")
+
+    logger.info(f"[green]  ✓ PDF 总计提取 {len(all_dois)} 个唯一 DOI[/]")
+    return list(all_dois)
 
 
 def get_seed_dois() -> List[str]:
@@ -902,10 +1188,12 @@ def main():
             # 更新评分到数据库
             db.update_paper(doi, relevance_score=score)
 
-            # 2g. 根据评分决定是否下载
-            if score in (1, 2):
-                # 相关（核心相关或部分相关），尝试下载
-                score_dir_name: str = "core_papers" if score == 1 else "relevant_papers"
+            # 2g. 根据评分决定是否下载（10 级评分）
+            #   score ≥ 7 → 核心/高度相关，下载到 core_papers/
+            #   score 5-6 → 中等相关，下载到 relevant_papers/
+            #   score ≤ 4 → 边缘/不相关，不下载
+            if score >= 5:
+                score_dir_name: str = "core_papers" if score >= 7 else "relevant_papers"
                 score_output_dir: Path = OUTPUT_DIR / score_dir_name
                 exit_code = downloader.download(doi, output_dir=score_output_dir)
 
@@ -922,42 +1210,48 @@ def main():
                     db.update_paper(doi) 
                     continue
 
-                # ── 滚雪球逻辑 ──
+                # ── 滚雪球逻辑（基于评分的门控） ──
                 current_depth = db.get_depth(doi)
                 next_depth = current_depth + 1
 
                 # 只有未超过最大深度才继续滚雪球
                 if SNOWBALL_ENABLED and next_depth <= SNOWBALL_MAX_DEPTH:
-                    # 来源 1：API 元数据中的引用文献
-                    if ref_dois:
-                        newly_added = db.add_dois_batch(ref_dois, depth=next_depth)
-                        logger.info(
-                            f"[cyan]  📚 [滚雪球 L{next_depth}] API引用文献: 共 {len(ref_dois)} 篇, 新增入库 {newly_added} 篇[/]"
-                        )
-
-                    # 来源 2：从下载的 PDF 文件中提取 DOI
-                    if SNOWBALL_FROM_PDF and success:
-                        safe_name = doi.replace("/", "_")
-                        safe_name = re.sub(r'[<>:"|?*\\]', "_", safe_name)
-                        safe_name_str: str = safe_name
-                        pdf_file = score_output_dir / f"{safe_name_str}.pdf"
-                        if pdf_file.exists():
-                            pdf_dois = extract_dois_from_pdf(pdf_file)
-                            # 去掉自己的 DOI
-                            pdf_dois = [d for d in pdf_dois if d != doi]
-                            if pdf_dois:
-                                pdf_added = db.add_dois_batch(pdf_dois, depth=next_depth)
-                                logger.info(
-                                    f"[cyan]  📚 [滚雪球 L{next_depth}] PDF提取引用: 共 {len(pdf_dois)} 篇, 新增入库 {pdf_added} 篇[/]"
-                                )
+                    if score >= 7:
+                        # 高相关分支：展开全部引用（API + PDF）
+                        if ref_dois:
+                            newly_added = db.add_dois_batch(ref_dois, depth=next_depth, parent_score=score)
+                            logger.info(
+                                f"[cyan]  📚 [滚雪球 L{next_depth}] API引用文献: 共 {len(ref_dois)} 篇, 新增入库 {newly_added} 篇[/]"
+                            )
+                        if SNOWBALL_FROM_PDF and success:
+                            safe_name = doi.replace("/", "_")
+                            safe_name = re.sub(r'[<>:"|?*\\]', "_", safe_name)
+                            safe_name_str: str = safe_name
+                            pdf_file = score_output_dir / f"{safe_name_str}.pdf"
+                            if pdf_file.exists():
+                                pdf_dois = extract_dois_from_pdf(pdf_file)
+                                pdf_dois = [d for d in pdf_dois if d != doi]
+                                if pdf_dois:
+                                    pdf_added = db.add_dois_batch(pdf_dois, depth=next_depth, parent_score=score)
+                                    logger.info(
+                                        f"[cyan]  📚 [滚雪球 L{next_depth}] PDF提取引用: 共 {len(pdf_dois)} 篇, 新增入库 {pdf_added} 篇[/]"
+                                    )
+                    elif score >= 5:
+                        # 中等相关分支：仅展开 API 引用（不提取 PDF，节省时间）
+                        if ref_dois:
+                            newly_added = db.add_dois_batch(ref_dois, depth=next_depth, parent_score=score)
+                            logger.info(
+                                f"[cyan]  📚 [滚雪球 L{next_depth}] API引用文献(精简): 共 {len(ref_dois)} 篇, 新增入库 {newly_added} 篇[/]"
+                            )
+                        logger.info(f"[dim]  ℹ️ score={score} 中等相关，跳过 PDF 引用提取以节省时间[/]")
                 elif not SNOWBALL_ENABLED:
                     logger.info(f"[dim]  ℹ️ 滚雪球已关闭 (配置 snowball.enabled=false)[/]")
                 else:
                     logger.info(f"[dim]  ℹ️ 已达最大滚雪球深度 {SNOWBALL_MAX_DEPTH}，不再继续提取引用[/]")
             else:
-                # 不相关（score=3），标记为 evaluated，不下载、不提取引用
+                # score ≤ 4：边缘/不相关，标记为 evaluated，不下载也不展开引用
                 db.update_paper(doi, status="evaluated")
-                logger.info(f"[dim]  ⏭ 不相关，跳过下载和引用提取[/]")
+                logger.info(f"[dim]  ⏭ score={score} ≤ 4，边缘/不相关，跳过下载和引用提取[/]")
 
             # 每 10 轮打印一次详细进度
             if iteration % 10 == 0:
